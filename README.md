@@ -16,9 +16,12 @@ Requirements:
 - Virtualenv (recommended)
 
 
-1. ```virtualenv env```
-2. ```source env/bin/activate```
-3. ```pip install -r requirements.txt``` (Might take a while, especially installing scipy and numpy can take long)
+```
+> virtualenv env
+> source env/bin/activate
+> pip install -r requirements.txt  
+# Might take a while, especially installing scipy and numpy can take long)
+```
 
 Running
 ============
