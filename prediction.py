@@ -2,14 +2,15 @@ import sys
 import math
 from pprint import pprint
 from itertools import chain, combinations
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
 
 import pandas as pd
 import numpy as np
 from sklearn import cross_validation, tree, svm, linear_model, preprocessing, \
-    neighbors
+    neighbors, ensemble
 import matplotlib.pyplot as plt
+from workalendar.usa import Maryland
 
 def rmsle(actual_values, predicted_values):
     '''
@@ -20,24 +21,15 @@ def rmsle(actual_values, predicted_values):
             "Both input paramaters should have the same length"
 
     # Depending on the regression method, the input paramaters can be either
-    # a numpy.ndarray or a list, for the formet we need to convert it to a list
-    if type(actual_values) is np.ndarray:
-        actual_values = np.reshape(actual_values, len(actual_values))
-    if type(predicted_values) is np.ndarray:
-        predicted_values = np.reshape(predicted_values, len(predicted_values))
+    # a numpy.ndarray or a list, we need to make sure it's a 1D iterable
+    actual_values = np.ravel(actual_values)
+    predicted_values = np.ravel(predicted_values)
 
     total = 0
     for a, p in zip(actual_values, predicted_values):
         total += math.pow(math.log(p+1) - math.log(a+1), 2)
 
     return math.sqrt(total/len(actual_values))
-
-def powerset(iterable):
-    '''
-        powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)
-    '''
-    s = list(iterable)
-    return chain.from_iterable(combinations(s, r) for r in range(len(s)+1))
 
 def pre_process_data(data, selected_columns):
     '''
@@ -58,8 +50,42 @@ def pre_process_data(data, selected_columns):
     data['hour_of_day_sin'] = data['hour_of_day'].apply(lambda hour: math.sin(2*math.pi*hour/24))
     data['hour_of_day_cos'] = data['hour_of_day'].apply(lambda hour: math.cos(2*math.pi*hour/24))
 
+    # Since it seems the service got more popular over time, we might need some
+    # way of telling how far we are from the beginning
     first_day = datetime.strptime('2011-01-01', "%Y-%m-%d").date()
     data['day_since_begin'] = data['datetime'].apply(lambda i: (i.date()-first_day).days)
+
+    # For some reason the dataset didn't indicate new year's day and christmas
+    # day as holidays. Therefore we also use this external libraryto check if
+    # a day is a holiday
+    cal = Maryland()
+    holidays = cal.holidays(2011)
+    holidays += cal.holidays(2012)
+
+    holidays = set([dt for (dt, name) in holidays])
+    data['holiday_external'] = data['datetime'].apply(lambda i: int(i.date() in holidays))
+
+    # Is it a holiday tomorrow or yesterday?
+    data['almost_holiday'] = data['datetime'].apply(
+        lambda i: int(i.date() - timedelta(days=1) in holidays or
+            i.date() + timedelta(days=1) in holidays)
+        )
+
+    # Some simple model of rush hour
+    data['rush_hour'] = data['datetime'].apply(
+        lambda i: min([math.fabs(8-i.hour), math.fabs(18-i.hour)])
+    )
+    data.ix[data['workingday'] == 0,'rush_hour'] = \
+        data['datetime'].apply(
+            lambda i: math.fabs(14-i.hour)
+        )
+    data.ix[data['holiday_external'] == 1,'rush_hour'] = \
+        data['datetime'].apply(
+            lambda i: math.fabs(14-i.hour)
+        )
+
+    # Add the day of the week
+    data['weekday'] = data['datetime'].apply(lambda i: i.weekday())
 
     # Some variables have no numerical value, they are categorical. E.g. the weather
     # variable has numerical values, but they cannot be interpreted as such.
@@ -67,7 +93,7 @@ def pre_process_data(data, selected_columns):
     # A method to deal with this is one-hot-enconding, which splits the existing
     # variable in n variables, where n equals the number of possible values.
     # See
-    for column in ['season', 'weather']:
+    for column in ['season', 'weather', 'weekday']:
         dummies = pd.get_dummies(data[column])
         # Concat actual column name with index
         new_column_names = [column + str(i) for i in dummies.columns]
@@ -75,65 +101,138 @@ def pre_process_data(data, selected_columns):
 
     data = data[selected_columns]
 
-    # Let scale the data set to have zero mean and unit variance, this makes sure variables with different orders of magnitude
-    # are treated equally
-    #data = preprocessing.scale(data)
-    data = data.values
+    return data.values
 
-    return data
+def print_feature_importance(data, features, labels_casual, labels_registered):
+    '''
+        Use a random forest regressor to print some info on how important the
+        diffrent features are
+    '''
+    clf_c = ensemble.RandomForestRegressor(n_estimators=150)
+    clf_r = ensemble.RandomForestRegressor(n_estimators=150)
 
-def main():
+    clf_c.fit(data,np.ravel(labels_casual))
+    clf_r.fit(data,np.ravel(labels_registered))
+
+    print 'Registered features:'
+    pprint(sorted(zip(features, clf_r.feature_importances_),
+        key=lambda i: i[1], reverse=True))
+    print 'Casual features:'
+    pprint(sorted(zip(features, clf_c.feature_importances_),
+        key=lambda i: i[1], reverse=True))
+
+def main(algorithm='random-forest'):
+    # Read data from file and convert to dataframe
     data = pd.read_csv("data/train.csv")
     data = pd.DataFrame(data = data)
 
+    # This list decides which features are going to be used, the rest is filtered out
     features = ['day_since_begin', 'hour_of_day_cos', 'hour_of_day_sin', 'workingday',
-        'temp', 'atemp', 'weather1', 'weather2', 'weather3', 'weather4', 'season1',
-         'season2', 'season3', 'season4']
+        'temp', 'weather1', 'weather3', 'holiday_external', 'almost_holiday',
+        'weekday0', 'weekday1', 'weekday2', 'weekday3', 'weekday4', 'weekday5',
+        'weekday6', 'humidity', 'windspeed', 'rush_hour', 'holiday']
 
+    # Extract and select features
     train_data = pre_process_data(data, features)
-    train_labels = data[['count']].values.astype(float)
 
-    kf = cross_validation.KFold(len(data), n_folds=5, shuffle=False)
+    # Get target values
+    train_labels_casual = data[['casual']].values.astype(float)
+    train_labels_registered = data[['registered']].values.astype(float)
+    train_labels_count = data[['count']].values.astype(float)
+
+    # Inspect feature importance
+    print_feature_importance(
+        train_data, features, train_labels_casual, train_labels_registered
+    )
+
+    # Do cross validation by leaving out specific weeks
+    weeks = data['datetime'].apply(lambda i: str(i.year) + '-' + str(i.week))
+
+    # Take out 10 weeks to test on, but don't do ALL permutations
+    kf = []
+    for fold in cross_validation.LeavePLabelOut(weeks, p=10):
+        kf.append(fold)
+        if len(kf) == 6:
+            break
 
     scores = []
-    for train_index, test_index in kf:
+    for fold, (train_index, test_index) in enumerate(kf):
+        print "Computing fold %d" % fold
+
         # Train the model
-        clf = tree.DecisionTreeRegressor()
-        #clf = svm.SVR(kernel='rbf', C=1e3)
-        #clf = linear_model.Ridge (alpha = 1.5)
-        #clf = linear_model.Lasso(alpha = 0.1)
-        #clf = neighbors.KNeighborsRegressor(n_neighbors=5, weights='uniform')
-        clf.fit(train_data[train_index],np.ravel(train_labels[train_index]))
-        print clf
+
+        if algorithm == 'ridge':
+            clf_c = linear_model.Ridge(alpha = 1.5)
+            clf_r = linear_model.Ridge(alpha = 1.5)
+
+        elif algorithm == 'decision-tree':
+            clf_c = tree.DecisionTreeRegressor(max_depth=15)
+            clf_r = tree.DecisionTreeRegressor(max_depth=15)
+
+        elif algorithm == 'knn':
+            clf_c = neighbors.KNeighborsRegressor(n_neighbors=5, weights='distance')
+            clf_r = neighbors.KNeighborsRegressor(n_neighbors=5, weights='distance')
+
+        elif algorithm == 'svr':
+            clf_c = svm.SVR(kernel='rbf', C=10000, epsilon=5)
+            clf_r = svm.SVR(kernel='rbf', C=10000, epsilon=5)
+
+        elif algorithm == 'random-forest':
+            clf_c = ensemble.RandomForestRegressor(n_estimators=150)
+            clf_r = ensemble.RandomForestRegressor(n_estimators=150)
+        else:
+            raise Exception("Unkown algorithm type, choices are: 'ridge'," +
+                " 'decision-tree', 'knn', 'svr', and 'random-forest' (default)")
+
+        clf_c.fit(train_data[train_index],np.ravel(train_labels_casual[train_index]))
+        clf_r.fit(train_data[train_index],np.ravel(train_labels_registered[train_index]))
+
         # Test it
-        predicted = clf.predict(train_data[test_index])
+        predicted_c = clf_c.predict(train_data[test_index])
+        predicted_r = clf_r.predict(train_data[test_index])
 
         # Some methods can predict negative values
-        predicted = [p if p > 0 else 0 for p in predicted]
+        predicted_c = [p if p > 0 else 0 for p in predicted_c]
+        predicted_r = [p if p > 0 else 0 for p in predicted_r]
 
+        # Plot predicted vs true values for a random week
         df = pd.DataFrame({'datetime': data['datetime'].values[test_index],
-            'true': np.ravel(train_labels[test_index]),'predicted': np.ravel(predicted)})
+            'true_c': np.ravel(train_labels_casual[test_index]),
+            'predicted_c': np.ravel(predicted_c),
+            'true_r': np.ravel(train_labels_registered[test_index]),
+            'predicted_r': np.ravel(predicted_r)})
+
         index = random.randint(0,len(df))
-        df[index:index+48].plot(x='datetime')
+        df[index:index+24*7].plot(x='datetime')
         plt.show()
 
-        scores.append(rmsle(train_labels[test_index], predicted))
+        # Add casual and registered prediction
+        predicted = [c+r for (c,r) in zip(predicted_c, predicted_r)]
+
+        scores.append(rmsle(train_labels_count[test_index], predicted))
 
     # Print average cross-validation score
     avg = sum(scores) / len(scores)
     print "Average RMSLE:", avg
 
-    # Train on all data
-    clf.fit(train_data,np.ravel(train_labels))
+    # Train classifier on all data
+    clf_c.fit(train_data,np.ravel(train_labels_casual))
+    clf_r.fit(train_data,np.ravel(train_labels_registered))
 
     # Predict test data
-
     test_data = pd.read_csv("data/test.csv")
     test_data = pd.DataFrame(data = test_data)
     transformed_test_data = pre_process_data(test_data, features)
 
     # Predict all test data
-    predicted = clf.predict(transformed_test_data)
+    predicted_c = clf_c.predict(transformed_test_data)
+    predicted_r = clf_r.predict(transformed_test_data)
+
+    # Add up casual and registered prediction
+    predicted = [c+r for (c,r) in zip(predicted_c, predicted_r)]
+
+    # Some methods can predict negative values
+    predicted = [p if p > 0 else 0 for p in predicted]
 
     # Write the output to a csv file
     output = pd.DataFrame()
@@ -143,6 +242,12 @@ def main():
     # Don't write row numbers, using index=False
     output.to_csv('data/predicted.csv', index=False)
 
-
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 1:
+        main()
+    elif len(sys.argv) == 2:
+        main(sys.argv[1])
+    else:
+        print "Uknown number of parameters.\n"
+        print "Usage 'python prediction.py' or 'python prediction.py [algorithm]'"
+        exit(1)
